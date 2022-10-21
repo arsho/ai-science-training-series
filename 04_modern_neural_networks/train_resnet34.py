@@ -300,7 +300,7 @@ def main():
     # Here's some configuration:
     #########################################################################
     BATCH_SIZE = 256
-    N_EPOCHS = 10
+    N_EPOCHS = 1
 
     train_ds, val_ds = prepare_data_loader(BATCH_SIZE)
 
@@ -323,7 +323,7 @@ def main():
 
 
     # We need an optimizer.  Let's use Adam:
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
 
     checkpoint = tf.train.Checkpoint(
         network       = network,
