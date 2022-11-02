@@ -86,4 +86,5 @@ scratch/
 # Misc
 .DS_Store
 04_modern_neural_networks/resnet34/*
+07_largeScaleTraining/venv/*
 
