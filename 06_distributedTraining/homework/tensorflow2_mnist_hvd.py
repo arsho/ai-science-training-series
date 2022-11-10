@@ -16,8 +16,14 @@
 import tensorflow as tf
 import argparse
 import numpy as np
-
+import os
 import time
+import matplotlib.pyplot as plt
+
+# This limits the amount of memory used:
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=2"
+
 t0 = time.time()
 parser = argparse.ArgumentParser(description='TensorFlow MNIST Example')
 parser.add_argument('--batch_size', type=int, default=256, metavar='N',
@@ -33,9 +39,20 @@ parser.add_argument('--num_intra', default=0, help='set number intra', type=int)
 
 args = parser.parse_args()
 
-# HVD-1 - initialize Horovd
+# This control parallelism in Tensorflow
+parallel_threads = 128
+# This controls how many batches to prefetch
+prefetch_buffer_size = 8 # tf.data.AUTOTUNE
+
+
+# Step 1: Initialize Horovod
 import horovod.tensorflow as hvd
 hvd.init()
+print("# I am rank %d of %d" %(hvd.rank(), hvd.size()))
+parallel_threads = parallel_threads//hvd.size()
+os.environ['OMP_NUM_THREADS'] = str(parallel_threads)
+num_parallel_readers = parallel_threads
+
 
 
 if args.device == 'cpu':
@@ -45,8 +62,9 @@ else:
     # HVD-2 - Assign GPUs to each rank
     gpus = tf.config.experimental.list_physical_devices('GPU')
     tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
+#     gpus = tf.config.experimental.list_physical_devices('GPU')
+#     for gpu in gpus:
+#         tf.config.experimental.set_memory_growth(gpu, True)
 
 
 
@@ -86,7 +104,8 @@ mnist_model = tf.keras.Sequential([
     tf.keras.layers.Dense(10, activation='softmax')
 ])
 loss = tf.losses.SparseCategoricalCrossentropy()
-# HVD-3 scale the learning rate
+
+# Scale the learning rate with number of workers
 opt = tf.optimizers.Adam(args.lr*hvd.size())
 
 checkpoint_dir = './checkpoints/tf2_mnist'
@@ -103,6 +122,7 @@ def training_step(images, labels):
         pred = tf.math.argmax(probs, axis=1)
         equality = tf.math.equal(pred, labels)
         accuracy = tf.math.reduce_mean(tf.cast(equality, tf.float32))
+
     # HVD-4 wrap the gradient tape
     tape = hvd.DistributedGradientTape(tape)
     grads = tape.gradient(loss_value, mnist_model.trainable_variables)
@@ -134,9 +154,16 @@ for ep in range(args.epochs):
     tt0 = time.time()
     for batch, (images, labels) in enumerate(dataset.take(nstep)):
         loss_value, acc = training_step(images, labels)
+        
+        # HVD - 8 average the metrics 
+        total_loss = hvd.allreduce(loss_value, average=True)
+        total_acc = hvd.allreduce(acc, average=True)   
+        loss_value = total_loss
+        acc = total_acc
+        
         training_loss += loss_value/nstep
         training_acc += acc/nstep
-        if batch % 100 == 0: 
+        if batch % 100 == 0 and hvd.rank()==0: 
             checkpoint.save(checkpoint_dir)
             print('Epoch - %d, step #%06d/%06d\tLoss: %.6f' % (ep, batch, nstep, loss_value))
     # Testing
@@ -153,7 +180,27 @@ for ep in range(args.epochs):
     metrics['valid_acc'].append(test_acc.numpy())
     metrics['valid_loss'].append(test_loss.numpy())
     metrics['time_per_epochs'].append(tt1 - tt0) 
-checkpoint.save(checkpoint_dir)
+    
+# Save the network after every epoch:
+if (hvd.rank()==0):
+    checkpoint.save(checkpoint_dir)    
+    
+
 np.savetxt("metrics.dat", np.array([metrics['train_acc'], metrics['train_loss'], metrics['valid_acc'], metrics['valid_loss'], metrics['time_per_epochs']]).transpose())
 t1 = time.time()
 print("Total training time: %s seconds" %(t1 - t0))
+
+# Ploting the result using hvd size
+hvdsize = hvd.size()
+x_label = "Epoch"
+y_label = "Accuracy value"
+validation_x_axis = np.arange(len(metrics['valid_acc']))
+validation_y_axis = metrics['valid_acc']
+training_x_axis = np.arange(len(metrics['train_acc']))
+training_y_axis = metrics['train_acc']
+plt.plot(validation_x_axis, validation_y_axis, label="Validation Accuracy")
+plt.plot(training_x_axis, training_y_axis, label="Training Accuracy")
+plt.xlabel(x_label)
+plt.ylabel(y_label)
+plt.legend()
+plt.savefig("accuracy_%s.pdf" %hvdsize)
